@@ -1,121 +1,208 @@
-from src import TrainPageGetter, StationsGetter, StationTimetableGetter, config
-from flask import Flask, jsonify, send_from_directory
-from flask_cors import CORS
+import os
+import logging
 from datetime import datetime, timedelta
-from dateutil import tz, parser
+from zoneinfo import ZoneInfo
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+from src import (
+    TrainPageGetter,
+    StationsGetter,
+    StationTimetableGetter,
+    config,
+)
 
 app = Flask(__name__)
 CORS(app)
 
-# Generate the station lookup table
-config.global_station_list = {}
-stations = StationsGetter.get_stations()
-for station in stations:
-    config.global_station_list[station["name"]] = station["station_id"]
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-@app.route('/static/<path:path>')
-def send_res(path):
-    return send_from_directory('static', path)
+API_KEY = os.environ.get("API_KEY", "")
+TZ = ZoneInfo("Europe/Bucharest")
 
-@app.route('/')
-def hello_world():
-    return 'Hello, World!'
+STATION_NAMES = {
+    "tecuci": ["tecuci"],
+    "galati": ["galati", "galați"],
+}
 
 
-@app.route('/train/<string:train_id>')
-def get_train(train_id):
-    train_list = TrainPageGetter.get_train(train_id)
-    return jsonify(train_list)
+def authorized():
+    return not API_KEY or request.headers.get("X-API-Key") == API_KEY
 
 
-@app.route('/get-stations/')
+def find_station(stations, aliases):
+    for station in stations:
+        name = station.get("name", "").strip().lower()
+        if any(alias in name for alias in aliases):
+            return station
+    return None
+
+
 def get_stations():
-    return jsonify(stations)
+    return StationsGetter.get_stations()
 
 
-@app.route('/station/<int:station_id>')
-def get_timetable(station_id):
-    timetable = StationTimetableGetter.get_timetable(station_id)
-    return jsonify(timetable)
+@app.route("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "service": "tecuci-galati-trains",
+        "time": datetime.now(TZ).isoformat()
+    })
 
 
-def timetable_departures_filter(timetable):
-    departures_timetable = []
+@app.route("/api/stations")
+def api_stations():
+    if not authorized():
+        return jsonify({"error": "Unauthorized"}), 401
 
-    for item in timetable:
-        if item['is_origin'] or item['is_stop']:
-            departures_timetable.append(item)
-
-    return departures_timetable
-
-
-def timetable_arrivals_filter(timetable):
-    departures_timetable = []
-
-    for item in timetable:
-        if item['is_destination'] or item['is_stop']:
-            departures_timetable.append(item)
-
-    return departures_timetable
+    try:
+        return jsonify(get_stations())
+    except Exception:
+        logger.exception("Station lookup failed")
+        return jsonify({"error": "Nu s-au putut prelua statiile IRIS"}), 502
 
 
-def timestamp_current_filter(timetable):
-    current_timetable = []
+@app.route("/api/trains")
+def api_trains():
+    if not authorized():
+        return jsonify({"error": "Unauthorized"}), 401
 
-    for item in timetable:
-        timezone = tz.gettz('Europe/Bucharest')
-        beginning = datetime.now(tz=timezone) - timedelta(hours=1)
-        end = datetime.now(tz=timezone) + timedelta(hours=3)
+    try:
+        stations = get_stations()
 
-        if item['arrival_timestamp']:
-            arrival = parser.isoparse(item['arrival_timestamp'])
+        tecuci = find_station(stations, STATION_NAMES["tecuci"])
+        galati = find_station(stations, STATION_NAMES["galati"])
 
-            if beginning <= arrival <= end:
-                current_timetable.append(item)
-                continue
+        if not tecuci or not galati:
+            return jsonify({
+                "error": "Nu am identificat ambele statii",
+                "stations_found": [
+                    s.get("name") for s in stations
+                    if "tecuci" in s.get("name", "").lower()
+                    or "gala" in s.get("name", "").lower()
+                ]
+            }), 502
 
-            if beginning <= arrival + timedelta(minutes=item['delay']) <= end:
-                current_timetable.append(item)
-                continue
+        config.global_station_list = {
+            s["name"]: s["station_id"] for s in stations
+        }
 
-        if item['departure_timestamp']:
-            departure = parser.isoparse(item['departure_timestamp'])
+        directions = [
+            (tecuci, galati, "Tecuci → Galați"),
+            (galati, tecuci, "Galați → Tecuci"),
+        ]
 
-            if beginning <= departure <= end:
-                current_timetable.append(item)
-                continue
+        results = []
+        now = datetime.now(TZ)
+        end = now + timedelta(hours=24)
 
-            if beginning <= departure + timedelta(minutes=item['delay']) <= end:
-                current_timetable.append(item)
-                continue
+        for origin, destination, direction in directions:
+            timetable = StationTimetableGetter.get_timetable(
+                origin["station_id"]
+            )
 
-    return current_timetable
+            candidates = [
+                item for item in timetable
+                if item.get("is_origin") or item.get("is_stop")
+            ]
 
-@app.route('/station/<int:station_id>/departures')
-def get_departures_timetable(station_id):
-    timetable = StationTimetableGetter.get_timetable(station_id)
-    timetable = timetable_departures_filter(timetable)
-    return jsonify(timetable)
+            for item in candidates[:30]:
+                train_id = item.get("train_id")
+                if not train_id:
+                    continue
 
+                try:
+                    route = TrainPageGetter.get_train(str(train_id))
+                except Exception:
+                    logger.exception("Train detail failed: %s", train_id)
+                    continue
 
-@app.route('/station/<int:station_id>/departures/current')
-def get_current_departures_timetable(station_id):
-    timetable = StationTimetableGetter.get_timetable(station_id)
-    timetable = timestamp_current_filter(timetable)
-    timetable = timetable_departures_filter(timetable)
-    return jsonify(timetable)
+                origin_stop = None
+                destination_stop = None
 
+                for stop in route:
+                    name = stop.get("station_name", "").lower()
 
-@app.route('/station/<int:station_id>/arrivals')
-def get_arrivals_timetable(station_id):
-    timetable = StationTimetableGetter.get_timetable(station_id)
-    timetable = timetable_arrivals_filter(timetable)
-    return jsonify(timetable)
+                    if "tecuci" in name:
+                        origin_stop = stop
+                    if "gala" in name:
+                        destination_stop = stop
 
+                if not origin_stop or not destination_stop:
+                    continue
 
-@app.route('/station/<int:station_id>/arrivals/current')
-def get_current_arrivals_timetable(station_id):
-    timetable = StationTimetableGetter.get_timetable(station_id)
-    timetable = timestamp_current_filter(timetable)
-    timetable = timetable_arrivals_filter(timetable)
-    return jsonify(timetable)
+                origin_time = (
+                    origin_stop.get("departure_timestamp")
+                    or origin_stop.get("arrival_timestamp")
+                )
+                destination_time = (
+                    destination_stop.get("arrival_timestamp")
+                    or destination_stop.get("departure_timestamp")
+                )
+
+                if not origin_time or not destination_time:
+                    continue
+
+                try:
+                    departure = datetime.fromisoformat(
+                        origin_time.replace("Z", "+00:00")
+                    )
+                    arrival = datetime.fromisoformat(
+                        destination_time.replace("Z", "+00:00")
+                    )
+
+                    if departure.tzinfo is None:
+                        departure = departure.replace(tzinfo=TZ)
+                    if arrival.tzinfo is None:
+                        arrival = arrival.replace(tzinfo=TZ)
+
+                    if not (now <= departure <= end):
+                        continue
+
+                    delay = None
+                    if origin_stop.get("is_real_time"):
+                        delay = origin_stop.get("delay")
+
+                    results.append({
+                        "train_id": str(train_id),
+                        "direction": direction,
+                        "origin": origin.get("name"),
+                        "destination": destination.get("name"),
+                        "departure": departure.isoformat(),
+                        "arrival": arrival.isoformat(),
+                        "delay_minutes": delay,
+                        "status": (
+                            "live" if origin_stop.get("is_real_time")
+                            else "schedule"
+                        ),
+                        "source": "IRIS"
+                    })
+
+                except Exception:
+                    logger.exception("Invalid train timestamps")
+
+        unique = {}
+        for train in results:
+            unique[train["train_id"] + train["direction"]] = train
+
+        output = sorted(
+            unique.values(),
+            key=lambda x: x["departure"]
+        )
+
+        return jsonify({
+            "ok": True,
+            "source": "IRIS",
+            "updated_at": datetime.now(TZ).isoformat(),
+            "trains": output
+        })
+
+    except Exception:
+        logger.exception("Train retrieval failed")
+        return jsonify({
+            "ok": False,
+            "error": "Nu s-au putut prelua datele IRIS"
+        }), 502
